@@ -1,4 +1,4 @@
-from time import sleep
+from typing import Dict, List, NamedTuple, Tuple
 import pandas as pd 
 import numpy as np
 from io import StringIO
@@ -6,7 +6,9 @@ import shutil
 import scipy.signal
 import scipy.optimize
 import scipy.special
-import tqdm
+from scipy.integrate import simpson
+import statsmodels.api as sm
+from tqdm import tqdm
 import os 
 from datetime import datetime
 import matplotlib.pyplot as plt
@@ -214,7 +216,7 @@ def scrape_peak_table(file, detector='B', delimiter=','):
 
 def convert(file_path, detector='B', delimiter=',', peak_table=False, 
             output_dir=None,  save_prefix=None, save_suffix=None, 
-            verbose=True, overwrite_output_dir=False):
+            verbose=True, overwrite=False):
     """
     Reads the ASCII output from a Shimadzu HPLC and returns a DataFrame of the
     chromatogram. Converted files can also be saved to disk with human-readable 
@@ -247,7 +249,7 @@ def convert(file_path, detector='B', delimiter=',', peak_table=False,
     verbose : bool 
         If True a progress bar will print if there's more than 5 files to 
         process.
-    overwrite_output_dir : bool
+    overwrite : bool
         If True, empty `output_dir` and populate exclusively with the converted files
     """
 
@@ -257,7 +259,7 @@ def convert(file_path, detector='B', delimiter=',', peak_table=False,
 
     # Determine if there should be a verbose output
     if (verbose is True) & (len(file_path) >= 5):
-        iterator = enumerate(tqdm.tqdm(file_path, desc='Converting ASCII output.'))
+        iterator = enumerate(tqdm(file_path, desc='Converting ASCII output.'))
     else:
         iterator = enumerate(file_path)
     
@@ -271,19 +273,18 @@ def convert(file_path, detector='B', delimiter=',', peak_table=False,
         output_path += '/converted'
     else:
         output_path = output_dir
-<<<<<<< HEAD
         if os.path.isdir(output_path)==True:
-            if overwrite_output_dir:
+            if overwrite:
                 if os.path.isdir(output_path):
                     shutil.rmtree(output_path)
+                    # recursively makes all intermediate dirs, if missing
+                    os.makedirs(output_path)
             else:
-                raise FileExistsError(output_path)
+                raise FileExistsError("'{}' already exists, set overwrite=True to overwrite".format(output_path))
         else:
             # recursively makes all intermediate dirs, if missing
             os.makedirs(output_path)
 
-=======
->>>>>>> 1c5728a07aa6d1a066947ea244b9929b3b0b1f6d
     for _, f in iterator:
         with open(f, 'r') as file:
             raw_file = file.read()
@@ -422,6 +423,11 @@ class Chromatogram(object):
             if len(time_window) != 2:
                 raise ValueError(f'`time_window` must be of length 2 (corresponding to start and end points). Provided list is of length {len(time_window)}.')
 
+        # Retain some meta-data in Chromatogram obj
+        with open(file) as f:
+            line2 = f.readlines()[1]
+            self.sample_name = line2.strip("# \n")
+
         # Assign class variables 
         self.time_col = cols['time']
         self.int_col = cols['intensity']
@@ -439,16 +445,22 @@ class Chromatogram(object):
         else: 
             self.df = dataframe
 
-         # Correct for a negative baseline 
-        df = self.df
-        min_int = df[self.int_col].min() 
-        intensity = df[self.int_col] - min_int
-
         # Blank out vars that are used elsewhere
         self.window_df = None
         self.window_props = None
         self.peaks = None
         self.peak_df = None
+
+        self._null_df = pd.DataFrame({
+                        'retention_time': np.nan,
+                        'scale': np.nan,
+                        'skew': np.nan,
+                        'amplitude': np.nan,
+                        'area': 0,
+                        # pandas needs (at least) one of the values to be a list
+                        # so it's indexable, to create a df from a dict
+                        'peak_idx': [1]
+                    })
 
     def crop(self, time_window=None, return_df=False):
         """
@@ -510,7 +522,7 @@ class Chromatogram(object):
         if (buffer < 0):
             raise ValueError('Parameter `buffer` cannot be less than 0.')
 
-        # Correct for a negative baseline 
+        # Correct for a negative baseline and normalize the intensity
         df = self.df
         intensity = self.df[self.int_col].values
         norm_int = (intensity - intensity.min()) / (intensity.max() - intensity.min())
@@ -614,8 +626,10 @@ class Chromatogram(object):
         """
         amp, loc, scale, alpha = params
         _x = alpha * (x - loc) / scale
-        norm = np.sqrt(2 * np.pi * scale**2)**-1 * np.exp(-(x - loc)**2 / (2 * scale**2))
-        cdf = 0.5 * (1 + scipy.special.erf(_x / np.sqrt(2))) 
+        norm = np.exp(-np.square(x - loc) / (2 * np.square(scale)))/np.sqrt(2 * np.pi * np.square(scale))
+        # erf is really slow (relative to numpy array operations)
+        # and runs a shitload of times
+        cdf = 0.5 * (1 + scipy.special.erf(_x / np.sqrt(2)))
         return amp * 2 * norm * cdf
 
     def _fit_skewnorms(self, x, *params):
@@ -663,11 +677,15 @@ class Chromatogram(object):
         ----------
         verbose : bool
             If `True`, a progress bar will be printed during the inference.
+        Returns
+        -------
+        peak_props : dict
+            A dictionary containing
         """ 
         if self.window_props is None:
             raise RuntimeError('Function `_assign_peak_windows` must be run first. Go do that.')
         if verbose:
-            iterator = tqdm.tqdm(self.window_props.items(), desc='Fitting peak windows...')  
+            iterator = tqdm(self.window_props.items(), desc='Fitting peak windows...')  
         else:
             iterator = self.window_props.items()
 
@@ -717,8 +735,72 @@ class Chromatogram(object):
         self.peak_props = peak_props
         return peak_props
 
+    # visually, min_height could be 4-5 mV, but it messes up the inference,
+    # so until that's fixed, go safer
+    # 12 is safe peak height for bayesian inference
+    # numerical integration does better for smaller peaks
+    def _peak_categorize(self, min_bayes_height=12, min_numint_height=4):
+        first = np.min(self.df.index)
+        last = np.max(self.df.index)
+        lbound = self.df.loc[first,'intensity_mV']
+        rbound = self.df.loc[last,'intensity_mV']
+        all_intensities = self.df.loc[:,'intensity_mV']
+        max_intensity = np.max(all_intensities)
+        max_at_boundary = np.max([lbound, rbound])
+        if max_at_boundary < (max_intensity - min_bayes_height):
+            # safe for bayes
+            self.peak_category =  2
+        elif max_at_boundary < (max_intensity - min_numint_height):
+            # safe for numerical integration
+            self.peak_category = 1
+        else:
+            self.peak_category = 0
+        return self.peak_category
+
+    def safe_quantify(self, time_window=None, prominence=1E-3, rel_height=1.0, 
+                 buffer=100, verbose=True, guard=True):
+        try:
+            self.quantify(time_window, prominence, rel_height, 
+                 buffer, verbose, guard)
+        except ValueError:
+            print("quantify() failed! returning df w/nans and area=0")
+            self.peak_df = self._null_df
+            print("trying to compute area numerically")
+            self.quantify_by_numerical_integration(outer_window=[24.8,25.9])
+        if self.peak_category == 1:
+            print("trying to compute area numerically")
+            self.quantify_by_numerical_integration(outer_window=[24.8,25.9])
+        return self.peak_df
+
+    # rename to smtg better lmao
+    # TODO: add plotting utility
+    def quantify_by_numerical_integration(self, outer_window: List[float], plot=True):
+        initial_condn = self.df.time_min <= outer_window[0]
+        terminal_condn = self.df.time_min >= outer_window[1]
+        reduced_df = self.df.loc[initial_condn | terminal_condn]
+        xs = reduced_df.time_min.values
+        X = sm.add_constant(xs)
+        ys = reduced_df.intensity_mV.values
+        model = sm.OLS(ys,X)
+        results = model.fit()
+        all_xs = self.df.time_min.values
+        all_ys = self.df.intensity_mV.values
+        if plot:
+            # clear previous buffer
+            plt.show()
+            ax = sns.regplot(x=xs, y=ys)
+            ax.plot(all_xs, all_ys)
+            plt.show()
+        intercept, slope = results.params
+        _predict = lambda intensity: intensity*slope + intercept
+        y_correction = np.array([_predict(x) for x in all_xs])
+        corrected_ys = all_ys - y_correction
+        self.peak_df.loc[0,'area'] = simpson(corrected_ys, all_xs)
+        print(self.peak_df.loc[0,'area'])
+
+    # TODO this should just fail predictably if the fitting is really hard to do
     def quantify(self, time_window=None, prominence=1E-3, rel_height=1.0, 
-                 buffer=100, verbose=True):
+                 buffer=100, verbose=True, guard=False):
         R"""
         Quantifies peaks present in the chromatogram
         Parameters
@@ -753,6 +835,14 @@ class Chromatogram(object):
         :math:`t` is the time, :math:`r_t` is the retention time, :math:`\sigma`
         is the scale parameter, and :math:`\alpha` is the skew parameter.
         """
+        # make sure there is (at least one) clear peak
+        if guard:
+            self._peak_categorize()
+            if self.peak_category!=2:
+                self.peak_df = self._null_df
+                return self.peak_df
+
+        # TODO should mirror crop
         if time_window is not None:
             dataframe = self.df
             self.df = dataframe[(dataframe[self.time_col] >= time_window[0]) & 
@@ -764,19 +854,24 @@ class Chromatogram(object):
         peak_props = self._estimate_peak_params(verbose)
 
         # Set up a dataframe of the peak properties
-        peak_df = pd.DataFrame([])
+        cols = ['retention_time', 'scale', 'skew', 'amplitude', 'area', 'peak_idx']
+        data_types = ['float','float','float','float','float','int']
+        peak_df = pd.DataFrame({c:pd.Series(dtype=t) for c,t in zip(cols, data_types)})
         iter = 0 
         for _, peaks in peak_props.items():
             for _, params in peaks.items():
-                _dict = {'retention_time': params['retention_time'],
-                         'scale': params['std_dev'],
-                         'skew': params['alpha'],
-                         'amplitude': params['amplitude'],
-                         'area': params['area'],
-                         'peak_idx': iter + 1}     
+                _df = pd.DataFrame({
+                        'retention_time': params['retention_time'],
+                        'scale': params['std_dev'],
+                        'skew': params['alpha'],
+                        'amplitude': params['amplitude'],
+                        'area': params['area'],
+                        # pandas needs (at least) one of the values to be a list
+                        # so it's indexable, to create a df from a dict
+                        'peak_idx': [iter + 1]
+                    })
                 iter += 1
-                peak_df = peak_df.append(_dict, ignore_index=True)
-                peak_df['peak_idx'] = peak_df['peak_idx'].astype(int)
+                peak_df = pd.concat([peak_df, _df], ignore_index=True)
         self.peak_df = peak_df
 
         # Compute the mixture
@@ -792,6 +887,23 @@ class Chromatogram(object):
         self.mix_array = out
         return peak_df
 
+
+    def peak_area(
+        self, time_window: List[float], 
+        # when there is no signal, there is a lot of noise that the inference alg. doesn't handle well
+        # so the threshold functions to differentiate btw when there is a real signal and when there is
+        # only noise...
+        # Signal is too weak for this to actually work
+        # threshold: float = 1500
+    ):
+        self.crop(time_window)
+        #if np.max(self.df.intensity_mV) > threshold:
+        self.safe_quantify(time_window=time_window, verbose=False, guard=True)
+        self.peak_df.sort_values(by='area', ascending=False, inplace=True)
+        area =  self.peak_df.loc[0,'area']
+        return area
+
+    # TODO - display mixture plots on the same scale as the original data
     def show(self):
         """
         Displays the chromatogram with mapped peaks if available.
@@ -802,13 +914,14 @@ class Chromatogram(object):
         fig, ax = plt.subplots(1, 1, figsize=(8, 6))
         ax.set_xlabel(self.time_col)
         ax.set_ylabel(self.int_col)
+        ax.set_title(self.sample_name)
 
         # Plot the raw chromatogram
         ax.plot(self.df[self.time_col], self.df[self.int_col], 'k-', lw=2,
                 label='raw chromatogram') 
 
-        # Compute the skewnorm mix 
-        if self.peak_df is not None:
+        # Compute the skewnorm mix if the peak_df was successfully computed
+        if (self.peak_df is not None) and (not np.isnan(self.peak_df.loc[0,'scale'])):
             time = self.df[self.time_col].values
             # Plot the mix
             convolved = np.sum(self.mix_array, axis=1)
@@ -820,6 +933,56 @@ class Chromatogram(object):
         fig.patch.set_facecolor((0, 0, 0, 0))
         return [fig, ax]
 
+class Concentration(NamedTuple):
+    value: float 
+    units: str = 'mM'
+
+class ReferenceChromatograms(object):
+    """
+    A collection of chromatograms measured with a manually titrated
+    chemical as a set of calibration curves for comparison with
+    experimental data
+    """
+    def __init__(
+        self, chroms: List[Chromatogram], concs: List[Concentration],
+        ref_chemical: str, window: List[float]
+    ) -> None:
+        self.chemical = ref_chemical
+        self.chroms = chroms
+        self.concs = concs
+        for chrom in self.chroms:
+            chrom.crop(window)
+            chrom.quantify(verbose=False)
+            # sort so that the greatest value is at index 0
+            chrom.peak_df.sort_values(by='area', ascending=False, inplace=True)
+    
+    def _extract_calibration_curve(
+        self, zero_weighting: int = 30, plot=False
+    ):
+        # fit a linear regression
+        y0s = zero_weighting*[0]
+        ys = np.array([conc.value for conc in self.concs])
+        # prepend 0's to get y-intercept=0
+        ys = np.append(y0s, ys)
+        x0s = zero_weighting*[0]
+        xs = np.array([chrom.peak_df.loc[0,'area'] for chrom in self.chroms])
+        xs = np.append(x0s, xs)
+        X = sm.add_constant(xs)
+        model = sm.OLS(ys,X)
+        results = model.fit()
+        if plot:
+            sns.regplot(x=xs, y=ys)
+            plt.show()
+        intercept, slope = results.params
+        self._predict = lambda intensity: intensity*slope + intercept
+        return (intercept, slope, results.rsquared)
+
+    def predict(self, peak_area, through_zero=True):
+        if through_zero:
+            out = self._predict(peak_area) - self._predict(0)
+        else:
+            out = self._predict(peak_area)
+        return out
 
 def batch_process(file_paths, time_window=None,  show_viz=False,
                   cols={'time':'time_min', 'intensity':'intensity_mV'},  
@@ -858,7 +1021,7 @@ def batch_process(file_paths, time_window=None,  show_viz=False,
     chrom_dfs, peak_dfs, mixes = [], [], []
 
     # Perform the processing for each file
-    for i, f in enumerate(tqdm.tqdm(file_paths, desc='Processing files...')):
+    for i, f in enumerate(tqdm(file_paths, desc='Processing files...')):
         # Generate the sample id
         if '/' in f:
             file_name = f.split('/')[-1]
